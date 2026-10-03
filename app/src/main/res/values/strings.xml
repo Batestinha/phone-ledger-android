@@ -1,0 +1,6 @@
+<resources>
+    <string name="app_name">Phone Ledger</string>
+    <string name="autofill_service_description">Fill your phone numbers and record where each one was disclosed</string>
+    <string name="autofill_unlock">Unlock Phone Ledger</string>
+    <string name="autofill_all_numbers">All numbers…</string>
+</resources>
