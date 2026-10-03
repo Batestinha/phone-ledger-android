@@ -1,57 +1,61 @@
 # Phone Ledger for Android
 
-This is the focused Android application developed from the AliasVault 0.30.7 fork. It stores a person's own phone numbers, offers them only to detected phone-number fields through Android Autofill, and records a durable disclosure event before a selected number is returned to the requesting form.
+Phone Ledger stores a person's own phone numbers, offers them only to detected phone-number fields through Android Autofill, and keeps a durable ledger of where each number was disclosed. Manual entries cover people, organizations, places, apps, and other disclosures that have no URI.
 
-> **Alpha status:** v0.2.0 is intended for controlled sideload testing. The downloadable APK is debug-signed and the self-hosted sync path still requires live two-device validation against a deployed server before a production release.
+It is local-first and distributed directly as a sideloaded APK; there is no Google Play dependency. Optional multi-device synchronization uses the separate [Phone Ledger Server](https://github.com/Batestinha/phone-ledger-server).
 
 ## Privacy model
 
-- Local encrypted vault; no account is required.
-- AES-256-GCM with a key derived from the master password using PBKDF2-HMAC-SHA256 (310,000 iterations).
-- Optional authentication-per-use biometric unlock backed by Android Keystore, plus an optional rate-limited six-digit PIN.
-- No contacts, phone-state, call-log, SMS, or accessibility permission. Network access is used only after self-hosted sync is configured.
-- Web origins reported by browsers are accepted as requested, but stored as `UNVERIFIED` together with the browser package and signing-certificate digest.
-- Android exposes an origin, not the full browser path. Automatic records therefore contain the reported origin. A full URL can be stored on manual events.
-- An automatic event means the user selected a number for autofill; it does not claim the form was submitted.
+- The local vault is encrypted with AES-256-GCM. Its key is derived from the master password with PBKDF2-HMAC-SHA256 (310,000 rounds).
+- Optional authentication-per-use biometric unlock uses Android Keystore. An optional six-digit PIN wraps the vault key locally and locks for five minutes after five failures.
+- No contacts, phone-state, call-log, SMS, accessibility, advertising, or analytics permission is requested. Camera access is requested only when the user opens the bundled recovery-QR scanner.
+- Network access is used only after self-hosted sync is configured. The standalone server receives encrypted blobs, never plaintext phone numbers or disclosure records.
+- Web origins reported by browsers are stored as `UNVERIFIED` with the browser package and signing-certificate digest. Android exposes an origin rather than the full browser path; a full URL can be added manually.
+- An automatic event means the user selected a number for autofill. It does not claim the form was submitted.
 
-## Build
+## Build and test
 
-Use the checked-in Gradle wrapper. The build is intentionally limited to one worker by `gradle.properties`:
+Use JDK 17, the Android SDK declared by the project, and the checked-in Gradle wrapper. Host-side Gradle concurrency is intentionally limited in `gradle.properties`.
 
 ```sh
-./gradlew testDebugUnitTest assembleDebug --no-daemon --max-workers=1
+./gradlew testDebugUnitTest assembleDebug --no-daemon --no-parallel --max-workers=1
 ```
 
-The debug APK is produced at `app/build/outputs/apk/debug/app-debug.apk`. Published test artifacts are attached to GitHub releases rather than committed to the repository.
+The debug APK is produced at `app/build/outputs/apk/debug/app-debug.apk`. Published test artifacts are attached to GitHub releases and are not committed to the repository.
 
 The `fixture` module is a separate-package phone form used only to verify Autofill on physical devices. It requests no permissions and contains no production code.
 
-## Self-hosted sync
+## Standalone self-hosted sync
 
-Version 0.2 can synchronize through the API included with an AliasVault 0.30.7 self-hosted installation. In **Settings & data → Configure self-hosted sync**, either create a dedicated account or connect an existing dedicated account. Enter the API root such as `https://vault.example.org/api`, without the trailing `/v1`.
+In **Settings & data → Configure self-hosted sync**, either:
 
-The account must be dedicated to Phone Ledger. AliasVault's API exposes one opaque vault slot per account, so using the same account in both applications would make the clients compete for that slot. If server-side public registration is disabled, temporarily enable `PUBLIC_REGISTRATION_ENABLED` to create the account and disable it again afterward, or connect an account created while registration was enabled.
+- create an account with the server's short-lived, one-use invite; or
+- connect an existing account with its 32-character account ID and 24 recovery words, typed manually or scanned from a trusted enrolled device.
 
-Security and conflict behavior:
+There is no server password. The client generates a random 256-bit recovery root, encodes it as a checksummed BIP-39 phrase, and derives domain-separated payload and enrollment keys with HKDF-SHA256. Each phone has an independent Ed25519 device key. The ledger is encrypted client-side with AES-256-GCM, bound to the server instance and account IDs, and read back after upload to verify server retention.
 
-- Authentication uses AliasVault's Argon2id + 2048-bit SRP flow and verifies the server's SRP proof. The plaintext password is never sent to the server. Existing accounts with TOTP can provide their six-digit code while connecting.
-- The ledger payload is separately encrypted with AES-256-GCM using a domain-separated key derived from the sync password. The server stores only the opaque encrypted blob.
-- Server URL, refresh/access tokens, and the payload key are held inside the local encrypted vault. They are excluded from sync payloads and encrypted backup exports.
-- Only HTTPS URLs are accepted. Android's normal certificate trust validation applies; cleartext HTTP is disabled.
-- Entity IDs, update timestamps, and tombstones provide deterministic last-write-wins merging. Revision preconditions cause a fetch/merge/retry when two devices upload concurrently.
-- Sync runs while the local vault is unlocked: after local mutations, when the app resumes, or when **Sync now** is pressed. Local edits remain available offline and are retried on a later trigger.
-- The server can observe the account name, ciphertext size, request timing, and IP address according to its configuration. Phone Ledger always reports zero AliasVault credentials and sends no phone-number metadata outside the encrypted payload.
+Entity-specific logical mutation stamps—not wall clocks—drive deterministic conflict merging. Tombstones propagate deletion. If a restored server has a lower revision than an enrolled phone has observed, the phone repairs the rollback from its local encrypted state.
 
-## CSV import
+Recovery-key rotation is crash- and timeout-tolerant: the pending new key is encrypted into the local vault before the server request. On retry, the client determines whether the server committed by authenticating the remote blob with the pending and prior keys. A successful rotation revokes other devices; enroll them again with the new recovery kit.
 
-The header is `label,number,region,favorite,notes`. `number` is required. `region` is required when the number does not begin with `+`. Duplicate canonical E.164 numbers are skipped and reported.
+Recovery words and recovery QR codes are bearer secrets. Store the written kit offline. The app prevents screenshots while displaying it and never puts it on the clipboard, but a compromised unlocked phone can still expose it.
+
+## Migrating the v0.2 AliasVault alpha
+
+Version 0.3 recognizes the old local AliasVault sync configuration. The migration flow can make one final authenticated fetch and merge, after which you create or join a standalone Phone Ledger server account. Once the new encrypted vault has been uploaded and read back successfully, the old credentials are removed from the local vault. The old remote AliasVault blob is intentionally not deleted; remove it after validating all devices and backups.
+
+If the old refresh session has already expired or been revoked, use the current local data or reinstall v0.2 long enough to reauthenticate and sync before upgrading. The standalone service does not accept AliasVault credentials.
+
+## Data portability
+
+Phone numbers import and export as CSV. Disclosure events export as CSV. These files are plaintext and should be treated as sensitive. The `.phoneledger` backup is encrypted and intentionally excludes sync credentials and recovery material so restoring it cannot clone a live device session.
+
+## Direct release signing
+
+Stable APKs are signed with an owner-held offline key, outside CI. See [docs/RELEASE.md](docs/RELEASE.md). Debug and release-candidate artifacts are clearly named and must not be confused with a stable, owner-signed build.
 
 ## License and provenance
 
-This work is based on [AliasVault 0.30.7 at commit `7a1ffeb94`](https://github.com/aliasvault/aliasvault/commit/7a1ffeb94f71645ce36f2cc5e1344f7cdb15d61c) and remains under the GNU Affero General Public License v3.0. Phone Ledger is a new name and Android application ID; it is not presented as an official AliasVault product.
+This project is based on [AliasVault 0.30.7 at commit `7a1ffeb94`](https://github.com/aliasvault/aliasvault/commit/7a1ffeb94f71645ce36f2cc5e1344f7cdb15d61c) and remains under the GNU Affero General Public License v3.0. Phone Ledger is a new name and Android application ID; it is not an official AliasVault product.
 
-The Android client and server are intentionally separate projects. This repository contains only the client. It currently uses an unmodified AliasVault 0.30.7 self-hosted API; a separate Phone Ledger server repository should be created if and when server-specific endpoints or deployment changes are introduced.
-
-## Milestone status
-
-Version 0.2 adds optional self-hosted multi-device synchronization while preserving the fully local mode as the default. It deliberately reuses the reviewed AliasVault server authentication and opaque-vault APIs instead of introducing a second password protocol or server database.
+The Android client and standalone server intentionally live in separate repositories. Third-party components and the BIP-39 word-list source are documented in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

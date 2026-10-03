@@ -6,11 +6,14 @@ import app.phoneledger.android.model.DisclosureEvent
 import app.phoneledger.android.model.DisclosureMethod
 import app.phoneledger.android.model.DisclosureTarget
 import app.phoneledger.android.model.LedgerState
+import app.phoneledger.android.model.LegacySyncConfig
+import app.phoneledger.android.model.MutationStamp
 import app.phoneledger.android.model.PhoneNumberRecord
 import app.phoneledger.android.model.PhoneNumbers
 import app.phoneledger.android.model.PhoneStatus
 import app.phoneledger.android.model.SyncConfig
 import app.phoneledger.android.model.TargetDescriptor
+import app.phoneledger.android.model.newInstallationId
 import app.phoneledger.android.sync.LedgerMerger
 import app.phoneledger.android.sync.SyncManager
 import java.util.Arrays
@@ -77,25 +80,48 @@ object LedgerRepository {
 
     fun syncConfig(): SyncConfig? = synchronized(monitor) { requireOpen().state.sync?.copy() }
 
+    fun legacySyncConfig(): LegacySyncConfig? = synchronized(monitor) { requireOpen().state.legacySync?.copy() }
+
     fun configureSync(config: SyncConfig) = saveMetadata { it.copy(sync = config) }
 
     fun clearSync() = saveMetadata { it.copy(sync = null) }
+
+    fun clearLegacySync() = saveMetadata { it.copy(legacySync = null) }
 
     fun updateSyncSession(transform: (SyncConfig) -> SyncConfig) = saveMetadata { state ->
         val config = state.sync ?: return@saveMetadata state
         state.copy(sync = transform(config))
     }
 
-    fun integrateRemote(remote: LedgerState, observedLocalRevision: Long, observedLastSyncedRevision: Long): RemoteIntegration = synchronized(monitor) {
+    fun updateLegacySyncSession(transform: (LegacySyncConfig) -> LegacySyncConfig) = saveMetadata { state ->
+        val config = state.legacySync ?: return@saveMetadata state
+        state.copy(legacySync = transform(config))
+    }
+
+    fun integrateRemote(
+        remote: LedgerState,
+        observedLocalRevision: Long,
+        observedLastSyncedRevision: Long,
+        allowCleanAdoption: Boolean = true,
+    ): RemoteIntegration = synchronized(monitor) {
         val current = requireOpen()
-        val canAdopt = current.state.revision == observedLocalRevision &&
+        val canAdopt = allowCleanAdoption && current.state.revision == observedLocalRevision &&
             current.state.sync?.lastSyncedLocalRevision == observedLastSyncedRevision &&
             observedLocalRevision == observedLastSyncedRevision
         val integrated = if (canAdopt) {
             LedgerMerger.validate(remote)
-            remote.copy(sync = current.state.sync)
+            remote.copy(
+                logicalClock = maxOf(remote.logicalClock, current.state.logicalClock),
+                installationId = current.state.installationId,
+                sync = current.state.sync,
+                legacySync = current.state.legacySync,
+            )
         } else {
-            LedgerMerger.merge(current.state, remote).copy(sync = current.state.sync)
+            LedgerMerger.merge(current.state, remote).copy(
+                installationId = current.state.installationId,
+                sync = current.state.sync,
+                legacySync = current.state.legacySync,
+            )
         }
         val next = current.copy(state = integrated)
         store.save(next)
@@ -122,32 +148,38 @@ object LedgerRepository {
     }
 
     fun addPhone(label: String, rawNumber: String, region: String, favorite: Boolean, notes: String): PhoneNumberRecord =
-        mutate { state ->
+        mutate { state, stamp ->
             val e164 = PhoneNumbers.normalize(rawNumber, region)
             require(state.phones.none { it.deletedAt == null && it.e164 == e164 }) { "$e164 is already stored" }
             val record = PhoneNumberRecord(
                 label = label.trim().ifBlank { e164 }, e164 = e164, region = region.trim().uppercase(),
-                favorite = favorite, notes = notes.trim(),
+                favorite = favorite, notes = notes.trim(), version = stamp,
             )
             state.copy(phones = state.phones + record) to record
         }
 
-    fun updatePhone(id: String, label: String, favorite: Boolean, notes: String) = mutate { state ->
+    fun updatePhone(id: String, label: String, favorite: Boolean, notes: String) = mutate { state, stamp ->
         val existing = state.phones.firstOrNull { it.id == id && it.deletedAt == null }
             ?: throw IllegalArgumentException("Phone number not found")
-        val updated = existing.copy(label = label.trim().ifBlank { existing.e164 }, favorite = favorite, notes = notes.trim(), updatedAt = now())
+        val updated = existing.copy(
+            label = label.trim().ifBlank { existing.e164 }, favorite = favorite, notes = notes.trim(),
+            updatedAt = now(), version = stamp,
+        )
         state.copy(phones = state.phones.map { if (it.id == id) updated else it }) to Unit
     }
 
-    fun setPhoneRetired(id: String, retired: Boolean) = mutate { state ->
+    fun setPhoneRetired(id: String, retired: Boolean) = mutate { state, stamp ->
         val updated = state.phones.map {
-            if (it.id == id && it.deletedAt == null) it.copy(status = if (retired) PhoneStatus.RETIRED else PhoneStatus.ACTIVE, updatedAt = now()) else it
+            if (it.id == id && it.deletedAt == null) it.copy(
+                status = if (retired) PhoneStatus.RETIRED else PhoneStatus.ACTIVE,
+                updatedAt = now(), version = stamp,
+            ) else it
         }
         state.copy(phones = updated) to Unit
     }
 
     fun recordDisclosure(phoneId: String, target: TargetDescriptor, method: DisclosureMethod, note: String = ""): DisclosureEvent =
-        mutate { state ->
+        mutate { state, stamp ->
             val phone = state.phones.firstOrNull { it.id == phoneId && it.deletedAt == null }
                 ?: throw IllegalArgumentException("Phone number not found")
             require(method == DisclosureMethod.MANUAL || phone.status == PhoneStatus.ACTIVE) { "Retired numbers cannot be autofilled" }
@@ -155,16 +187,16 @@ object LedgerRepository {
             val targetId = DisclosureTarget.deterministicId(target.kind, target.canonicalKey)
             val existingTarget = state.targets.firstOrNull { it.id == targetId }
             val storedTarget = existingTarget?.copy(
-                displayName = target.displayName, updatedAt = timestamp, deletedAt = null,
+                displayName = target.displayName, updatedAt = timestamp, deletedAt = null, version = stamp,
             ) ?: DisclosureTarget(
                 id = targetId, kind = target.kind, canonicalKey = target.canonicalKey,
-                displayName = target.displayName, createdAt = timestamp, updatedAt = timestamp,
+                displayName = target.displayName, createdAt = timestamp, updatedAt = timestamp, version = stamp,
             )
             val event = DisclosureEvent(
                 phoneId = phoneId, targetId = targetId, method = method, occurredAt = timestamp,
                 detailUri = target.detailUri, note = note.trim(), clientPackage = target.clientPackage,
                 clientSignerSha256 = target.clientSignerSha256, originTrust = target.originTrust,
-                createdAt = timestamp, updatedAt = timestamp,
+                createdAt = timestamp, updatedAt = timestamp, version = stamp,
             )
             state.copy(
                 targets = if (existingTarget == null) state.targets + storedTarget else state.targets.map { if (it.id == targetId) storedTarget else it },
@@ -172,16 +204,20 @@ object LedgerRepository {
             ) to event
         }
 
-    fun updateEvent(id: String, detailUri: String?, note: String) = mutate { state ->
+    fun updateEvent(id: String, detailUri: String?, note: String) = mutate { state, stamp ->
         val updated = state.events.map {
-            if (it.id == id && it.deletedAt == null) it.copy(detailUri = detailUri?.trim()?.ifBlank { null }, note = note.trim(), updatedAt = now()) else it
+            if (it.id == id && it.deletedAt == null) it.copy(
+                detailUri = detailUri?.trim()?.ifBlank { null }, note = note.trim(), updatedAt = now(), version = stamp,
+            ) else it
         }
         state.copy(events = updated) to Unit
     }
 
-    fun deleteEvent(id: String) = mutate { state ->
+    fun deleteEvent(id: String) = mutate { state, stamp ->
         val timestamp = now()
-        state.copy(events = state.events.map { if (it.id == id && it.deletedAt == null) it.copy(deletedAt = timestamp, updatedAt = timestamp) else it }) to Unit
+        state.copy(events = state.events.map {
+            if (it.id == id && it.deletedAt == null) it.copy(deletedAt = timestamp, updatedAt = timestamp, version = stamp) else it
+        }) to Unit
     }
 
     fun importPhones(rows: List<CsvPhoneRow>): ImportReport {
@@ -202,14 +238,16 @@ object LedgerRepository {
 
     fun encryptedBackup(): ByteArray = synchronized(monitor) {
         val current = requireOpen()
-        store.encode(current.copy(state = current.state.copy(sync = null)))
+        store.encode(current.copy(state = current.state.copy(sync = null, legacySync = null)))
     }
 
     fun restoreBackup(context: Context, bytes: ByteArray, password: CharArray) {
         initialize(context)
         synchronized(monitor) {
             val candidate = store.decode(bytes, password)
-            val restored = candidate.copy(state = candidate.state.copy(sync = null))
+            val restored = candidate.copy(state = candidate.state.copy(
+                installationId = newInstallationId(), sync = null, legacySync = null,
+            ))
             store.save(restored)
             lockInternal()
             opened = restored
@@ -218,11 +256,16 @@ object LedgerRepository {
         }
     }
 
-    private fun <T> mutate(block: (LedgerState) -> Pair<LedgerState, T>): T {
+    private fun <T> mutate(block: (LedgerState, MutationStamp) -> Pair<LedgerState, T>): T {
         val result = synchronized(monitor) {
             val current = requireOpen()
-            val (changed, result) = block(current.state)
-            val next = current.copy(state = changed.copy(revision = current.state.revision + 1))
+            require(current.state.logicalClock < Long.MAX_VALUE) { "Logical clock is exhausted" }
+            val stamp = MutationStamp(current.state.logicalClock + 1, current.state.installationId)
+            val (changed, result) = block(current.state, stamp)
+            val next = current.copy(state = changed.copy(
+                revision = current.state.revision + 1,
+                logicalClock = stamp.counter,
+            ))
             store.save(next)
             opened = next
             result
